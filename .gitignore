@@ -1,0 +1,7 @@
+﻿# Never commit subscriber exports
+*.csv
+*.xlsx
+
+
+# Local tooling
+.claude/

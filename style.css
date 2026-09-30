@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; --accent: #e4572e; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, sans-serif; display: grid; min-height: 100vh; place-items: center; }
+main { width: 100%; max-width: 420px; padding: 24px 16px; text-align: center; }
+main.doc { max-width: 640px; text-align: left; }
+form { display: grid; gap: 10px; }
+input[type=email], button, .discord { font: inherit; padding: 12px 14px; border-radius: 8px; width: 100%; }
+input[type=email] { border: 1px solid #8888; }
+button, .discord { border: 0; background: var(--accent); color: #fff; cursor: pointer; text-decoration: none; display: block; }
+button:disabled { opacity: .6; }
+.discord { margin-top: 24px; background: #5865f2; }
+.consent { font-size: 13px; opacity: .8; margin: 0; }
+.hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+[hidden] { display: none !important; }
