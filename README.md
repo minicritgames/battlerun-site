@@ -1,6 +1,7 @@
 # battlerun-site
 
 Newsletter signup page for Battlerun, reached by QR code at conventions and playtests.
+Live at <https://devilinorbit.com/> (GitHub Pages custom domain; DNS at Namecheap).
 Static site on GitHub Pages; signups go to a Google Apps Script web app that writes them to a private Google Sheet and forwards them to Kit for sending.
 
 ```
