@@ -7,8 +7,8 @@
 
 const SHEET_NAME = 'Subscribers';
 // Must match the consent line on the site (index.html) word for word. Bump CONSENT_VERSION whenever the text changes.
-const CONSENT_TEXT = 'Get Battlerun news and playtest invites by email. Unsubscribe anytime. You must be 13 or older.';
-const CONSENT_VERSION = 'v1-2026-10';
+const CONSENT_TEXT = 'Get news and playtest invites by email. Unsubscribe anytime. You must be 13 or older.';
+const CONSENT_VERSION = 'v2-2026-10';
 const DEDUPE_SECONDS = 600;
 const HEADERS = [
   'timestamp',
