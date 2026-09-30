@@ -42,4 +42,6 @@ Then open <http://localhost:8000/?src=localtest>.
 
 ## QR codes
 
-Encode `https://<site host>/?src=<event-slug>`. Generate static codes locally with `segno` (error correction Q). Never use a dynamic-QR service.
+Codes encode `https://devilinorbit.com/?src=<event-slug>`; the slug lands in the Sheet's `source` column.
+To add an event, add its slug to `SOURCES` in `qr/make_qr.py` and run `python qr/make_qr.py` (needs `pip install segno`).
+Print the `.svg` files. Never use a dynamic-QR service.
