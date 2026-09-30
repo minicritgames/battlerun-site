@@ -57,9 +57,11 @@ function doPost(e) {
         cache.put(cacheKey, '1', DEDUPE_SECONDS);
         return json_({ ok: true }); // already on the list
       }
+      // With double opt-in, people aren't real subscribers until they confirm; syncFromProvider flips them to active.
+      const doubleOptIn = PropertiesService.getScriptProperties().getProperty('DOUBLE_OPT_IN') === 'true';
       sheet.appendRow([
         new Date(), email, source, CONSENT_TEXT, CONSENT_VERSION,
-        'kit', 'pending', '', 'active', '', '',
+        'kit', 'pending', '', doubleOptIn ? 'unconfirmed' : 'active', '', '',
       ]);
       row = sheet.getLastRow();
       cache.put(cacheKey, '1', DEDUPE_SECONDS);
@@ -165,7 +167,7 @@ function syncFromProvider() {
     if (state === 'cancelled') r[COL.status - 1] = 'unsubscribed';
     else if (state === 'bounced' || state === 'complained') r[COL.status - 1] = state;
     else if (state === 'active') r[COL.status - 1] = 'active';
-    // 'inactive' = has not confirmed double opt-in yet; leave status alone
+    // 'inactive' = has not confirmed double opt-in yet; leave status alone (stays 'unconfirmed')
   });
   range.setValues(values);
 }
