@@ -12,7 +12,7 @@ from pathlib import Path
 import segno
 
 SITE = "https://devilinorbit.com/"
-SOURCES = [None, "tiac-playtest", "ocig-2026"]
+SOURCES = ["direct-qr", "tiac-playtest", "ocig-2026"]
 OUT = Path(__file__).parent
 
 
