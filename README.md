@@ -6,7 +6,10 @@ Static site on GitHub Pages; signups go to a Google Apps Script web app that wri
 
 ```
 QR code → GitHub Pages (this repo) → Apps Script (apps-script/Code.gs) → Google Sheet (source of truth) → Kit
+                                                        └→ Cloudflare Worker relay (discord-relay/) → private Discord alert
 ```
+
+This README is the operator runbook. For how the system works, why it's built this way, and troubleshooting, see [docs/system.md](docs/system.md).
 
 ## Files
 
