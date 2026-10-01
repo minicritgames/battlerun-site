@@ -14,7 +14,8 @@ QR code → GitHub Pages (this repo) → Apps Script (apps-script/Code.gs) → G
 |---|---|
 | `index.html`, `main.js`, `style.css` | Signup page |
 | `privacy.html` | Privacy notice |
-| `config.js` | **The only file to edit for URLs**: Apps Script `/exec` URL, Discord invite, success message |
+| `confirmed.html` | "You're in" page Kit redirects to after someone clicks the confirmation link |
+| `config.js` | **The only file to edit for URLs**: Apps Script `/exec` URL, Discord invite, success title/message |
 | `apps-script/Code.gs` | Backend source of record. Paste into the Apps Script editor bound to the Sheet |
 | `qr/` | Generated QR codes |
 
@@ -81,7 +82,7 @@ Script Properties changes (e.g. `DOUBLE_OPT_IN`, `SITE_ORIGIN`) apply immediatel
 
 - Page text, button, Discord button: `index.html`. Success/error messages: `config.js` and `main.js`.
 - The consent line in `index.html` must match `CONSENT_TEXT` in `apps-script/Code.gs` word for word. When changing it, change both, bump `CONSENT_VERSION` (e.g. `v2-2026-11`), and redeploy the script.
-- The confirmation email and the email footer are edited in Kit, not here.
+- The confirmation email (subject, body, button) and the email footer are edited in Kit, not here: form **Website signup** → Settings → Incentive. Its post-confirmation redirect should point to `https://devilinorbit.com/confirmed.html`.
 
 ## Local testing
 

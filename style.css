@@ -10,6 +10,10 @@ button, .discord { border: 0; background: var(--accent); color: #fff; cursor: po
 button:disabled { opacity: .6; }
 .discord { margin-top: 24px; background: #5865f2; }
 .consent { font-size: 13px; opacity: .8; margin: 0; }
+#success h2 { font-size: 22px; margin: 0 0 8px; }
+#success h2:focus { outline: none; }
+#success p { margin: 0 0 12px; }
+.link-button { background: none; color: inherit; text-decoration: underline; padding: 4px; width: auto; display: inline; font-size: 14px; opacity: .8; }
 .hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 [hidden] { display: none !important; }

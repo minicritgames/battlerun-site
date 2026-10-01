@@ -3,7 +3,8 @@
 // Paste this into the Apps Script editor's Code.gs, then redeploy as a NEW VERSION of the existing deployment.
 //
 // Secrets/config live in Project Settings → Script Properties (never in this file):
-//   KIT_API_KEY, KIT_FORM_ID, DOUBLE_OPT_IN ("true" | "false"), SITE_ORIGIN (e.g. "https://minicritgames.github.io/battlerun-site")
+//   KIT_API_KEY, KIT_FORM_ID, DOUBLE_OPT_IN ("true" | "false"), SITE_ORIGIN (e.g. "https://minicritgames.github.io/battlerun-site"),
+//   DISCORD_SIGNUP_WEBHOOK_URL (optional; unset = no signup alerts)
 
 const SHEET_NAME = 'Subscribers';
 // Must match the consent line on the site (index.html) word for word. Bump CONSENT_VERSION whenever the text changes.
@@ -73,6 +74,7 @@ function doPost(e) {
     // A provider failure is recorded on the row and retried later; the signup itself already succeeded.
     const result = forwardToProvider_(email, source);
     writeProviderResult_(getSheet_(), row, result);
+    notifyDiscord_(email, source, result, row - 1);
     return json_({ ok: true });
   } catch (err) {
     console.error(err);
@@ -184,6 +186,55 @@ function retryFailedForwards() {
     writeProviderResult_(sheet, row, forwardToProvider_(email, source));
     Utilities.sleep(1200);
   }
+}
+
+// Private signup alert. Best-effort: a Discord failure must never fail the signup.
+function notifyDiscord_(email, source, result, total) {
+  const url = PropertiesService.getScriptProperties().getProperty('DISCORD_SIGNUP_WEBHOOK_URL');
+  if (!url) return;
+  const failed = String(result.status).startsWith('error');
+  let description = '(#' + total + ') `' + maskEmail_(email) + '`\nfrom: `' + source + '`';
+  if (failed) {
+    description += '\n:warning: Kit forward failed (`' + result.status + '`); will retry automatically.';
+  }
+  const embed = {
+    title: 'New subscriber',
+    description: description,
+    color: failed ? 15548997 : 16115650, // red on failure, otherwise the normal accent
+    timestamp: new Date().toISOString(),
+  };
+  try {
+    const res = UrlFetchApp.fetch(url.trim(), {
+      method: 'post',
+      contentType: 'application/json',
+      // allowed_mentions with an empty parse list means nothing in the message can ever ping anyone.
+      payload: JSON.stringify({ embeds: [embed], allowed_mentions: { parse: [] } }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() >= 300) {
+      console.error('Discord notify failed: ' + res.getResponseCode() + ' ' + res.getContentText().slice(0, 300));
+    }
+  } catch (err) {
+    console.error('Discord notify failed', err);
+  }
+}
+
+// "garrett@gmail.com" -> "ga*****@g****.com". Discord message history is less private than the Sheet.
+function maskEmail_(email) {
+  const at = email.lastIndexOf('@');
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  const dot = domain.lastIndexOf('.');
+  const domainName = domain.slice(0, dot);
+  const tld = domain.slice(dot);
+  const keep = local.length <= 2 ? 1 : 2;
+  return local.slice(0, keep) + '*'.repeat(Math.max(local.length - keep, 1))
+    + '@' + domainName.slice(0, 1) + '*'.repeat(Math.max(domainName.length - 1, 1)) + tld;
+}
+
+// Run from the editor to preview the alert without a real signup.
+function testDiscordAlert() {
+  notifyDiscord_('garrett@gmail.com', 'editor-test', { status: 'subscribed' }, 0);
 }
 
 // One-time setup (run manually from the editor; also triggers the authorization prompt)
