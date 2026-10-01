@@ -2,7 +2,7 @@
 
 > **Audience:** AI agents and developers maintaining, debugging, or extending this system. Read this before changing anything.
 > **Companion doc:** [`README.md`](../README.md) is the operator runbook (sending newsletters, removing people, paper signups). This doc covers how the system works, why it's built this way, and what breaks.
-> **Status (2026-10-01):** Live at <https://devilinorbit.com/>. All components deployed and verified end to end, including Discord alerts through the relay.
+> **Status (2026-10-01):** Live at <https://devilinorbit.com/>. All components deployed and verified end to end, including the "Sub requested" alert through the relay and the Kit-webhook "Sub confirmed" / "Sub cancelled" alerts. The project is considered done; this doc and the README are the handoff for future work.
 
 ---
 
@@ -11,7 +11,9 @@
 A visitor scans a printed QR code at a convention or playtest. The code opens a one-field signup page. Their email is:
 1. written to a private **Google Sheet**, the operator's master list, along with consent records,
 2. forwarded to **Kit** (kit.com), which sends a confirmation email (double opt-in) and later the newsletters,
-3. announced in a private **Discord** channel as a masked alert (e.g. `ga*****@g****.com`, `from: ocig-2026`).
+3. announced in a private **Discord** channel as a masked alert ("Sub requested", `ga*****@g****.com`, `source: ocig-2026`).
+
+Later lifecycle events also alert instantly in the same channel through Kit webhooks: **Sub confirmed** (they clicked the confirmation link), **Sub cancelled** (unsubscribed), plus bounces and spam complaints.
 
 The page also shows a Discord invite button. Everything runs on free tiers.
 
@@ -29,7 +31,8 @@ The page also shows a Discord invite button. Everything runs on free tiers.
 | Backend | Google Apps Script project `battlerun-signup`, **bound** to the Sheet (Sheet → Extensions → Apps Script) | [`apps-script/Code.gs`](../apps-script/Code.gs) | **Manual paste** into the editor, then redeploy as a new version (§6) | Google account that owns the Sheet |
 | Subscriber list | Google Sheet **Battlerun Subscribers**, tab **Subscribers** (private) | n/a (data) | n/a | Same Google account |
 | Newsletter provider | Kit, free Newsletter plan; form **Website signup**, ID `9984140` | n/a | Kit dashboard | Kit account |
-| Discord relay | Cloudflare Worker `discord-relay` on `*.workers.dev` | [`discord-relay/worker.js`](../discord-relay/worker.js) | **Manual paste** into the Cloudflare dashboard editor → Deploy | Cloudflare account (free) |
+| Discord relay + Kit webhook receiver | Cloudflare Worker `discord-relay` on `*.workers.dev` | [`discord-relay/worker.js`](../discord-relay/worker.js) | **Manual paste** into the Cloudflare dashboard editor → Deploy | Cloudflare account (free) |
+| Kit webhook endpoint | Registered in Kit via the API (no dashboard UI used), name "Discord subscriber alerts", URL `https://<worker-host>/kit-webhook` | `registerKitWebhook()` in `Code.gs` | Run once from the Apps Script editor | Kit account |
 | Signup alerts | Private Discord channel with a webhook named for the newsletter | n/a | Discord channel settings → Integrations → Webhooks | Discord server |
 | QR codes | `qr/*.svg` / `qr/*.png` | [`qr/make_qr.py`](../qr/make_qr.py) | Run locally, then print the files | n/a |
 
@@ -61,11 +64,19 @@ Apps Script web app  /exec   (Execute as: owner, Access: Anyone)
 Site replaces the form with "One more step: check your email" + "Wrong email? Fix it"
               │
 Person clicks the confirmation link in Kit's email ──► Kit marks them active
-              └─► Kit redirects to https://devilinorbit.com/confirmed.html ("You're in!" + Discord button)
+              ├─► Kit redirects to https://devilinorbit.com/confirmed.html ("You're in!" + Discord button)
+              └─► Kit webhook (subscriber.activated) ──► Worker /kit-webhook ──► Discord "Sub confirmed"
+
+Kit webhooks (instant), registered by registerKitWebhook():
+  subscriber.activated → "Sub confirmed" (green)    subscriber.unsubscribed → "Sub cancelled" (red)
+  subscriber.bounced   → "Email bounced" (orange)   subscriber.complained   → "Marked as spam" (red)
+  Worker /kit-webhook: verify X-Kit-Signature (HMAC-SHA256 of "<t>.<raw body>", 5-min tolerance)
+                       → reply 200 immediately → post masked embeds to Discord in the background (ctx.waitUntil)
+  These alerts do NOT update the Sheet; the hourly sync does.
 
 Time-based triggers (installed by installTriggers()):
-  syncFromProvider     daily ~3am  : pulls every Kit subscriber state into the Sheet
-  retryFailedForwards  every 6h    : re-forwards rows whose provider_status is error_* or pending
+  syncFromProvider     hourly    : pulls every Kit subscriber state into the Sheet
+  retryFailedForwards  every 6h  : re-forwards rows whose provider_status is error_* or pending
 ```
 
 Failures are isolated by design. A Kit failure still returns success to the visitor (the row is saved and retried later). A Discord failure never affects the signup.
@@ -106,13 +117,15 @@ Nothing secret is in this repo. The repo is **public** (free GitHub Pages requir
 | `SITE_ORIGIN` | Script Properties | No | Should be `https://devilinorbit.com`; used to build the Kit `referrer` |
 | `DISCORD_SIGNUP_WEBHOOK_URL` | Script Properties | **Yes** (contains the webhook token) | **Relay host**, not discord.com: `https://discord-relay.<subdomain>.workers.dev/api/webhooks/<id>/<token>`. Unset = no alerts |
 | `ALLOWED_WEBHOOK_ID` | Cloudflare → Worker `discord-relay` → Settings → Variables and Secrets (Text) | No | The numeric `<id>` only. Restricts the relay to this one webhook |
+| `DISCORD_WEBHOOK_URL` | Cloudflare Worker → Variables and Secrets (**Secret**) | **Yes** | The same Discord webhook with the normal `https://discord.com/...` host. Used by `/kit-webhook` to post directly |
+| `KIT_WEBHOOK_SECRET` | Cloudflare Worker → Variables and Secrets (**Secret**) | **Yes** | The `whsec_...` signing secret Kit returned **once** from `registerKitWebhook()`. Lost → rotate it via Kit's API (rotate-secret endpoint) or delete and re-register the endpoint |
 | `signupEndpoint` | `config.js` | No | Apps Script `/exec` URL. Public by design |
 | `discordInvite` | `config.js` | No | Permanent invite (never expires, unlimited uses) |
 | `successTitle` / `successMessage` | `config.js` | No | Post-signup screen text; `{email}` is replaced with the typed address |
 | `CONSENT_TEXT` / `CONSENT_VERSION` | `Code.gs` constants | No | Must match `index.html`'s consent line word for word |
 | `SCRIPT_REVISION` | `Code.gs` constant | No | Reported by GET `/exec`. Bump on every code change |
 
-Script Property changes take effect immediately, with no redeploy. If the Discord webhook token leaks, delete the webhook in Discord, create a new one, update `DISCORD_SIGNUP_WEBHOOK_URL` (relay host) and `ALLOWED_WEBHOOK_ID`.
+Script Property changes take effect immediately, with no redeploy. If the Discord webhook token leaks, delete the webhook in Discord, create a new one, then update `DISCORD_SIGNUP_WEBHOOK_URL` (relay host), `ALLOWED_WEBHOOK_ID` and the Worker's `DISCORD_WEBHOOK_URL`.
 
 ---
 
@@ -131,7 +144,13 @@ Commit and push to `main`. GitHub Pages redeploys in about a minute. Browsers ma
 Editor "Run" uses the latest *saved* code; the `/exec` URL uses the latest *deployed version*. A function working in the editor proves nothing about the live web app.
 
 ### Cloudflare Worker
-Workers & Pages → `discord-relay` → Edit code → paste `discord-relay/worker.js` → Deploy. Sanity check: opening the Worker URL in a browser (a GET) returns `Not found`, which is correct.
+Workers & Pages → `discord-relay` → Edit code → paste `discord-relay/worker.js` → Deploy. Sanity check: opening the Worker URL in a browser (a GET) returns `Not found`, which is correct. To debug Kit webhook deliveries, open the Worker's **Logs/Observability** and start live logs; responses are `401 Bad signature`, `503 Not configured` (a secret is missing), or `200 ok`.
+
+### Triggers
+Changing `installTriggers()` doesn't change existing triggers. After pasting new code, run `installTriggers` once from the editor (it deletes and recreates all of them). Check under **Triggers** (clock icon) in the sidebar.
+
+### Kit webhook endpoint
+Registered once with `registerKitWebhook()`. Running it again creates a **duplicate** endpoint (duplicate alerts). `listKitWebhooks()` shows what's registered. To change the event list or URL, use Kit's update-endpoint API rather than re-registering.
 
 ### Testing a signup without a browser
 ```bash
@@ -157,6 +176,9 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 | **Discord alerts via a Cloudflare Worker relay** (`2af6147`) | Discord's Cloudflare front blocks Apps Script's shared Google IPs: live signups got `429` + `error code: 1015` while editor runs worked. The relay sends from Cloudflare's network instead | Retrying from Apps Script (same blocked IPs); email alerts via MailApp (kept as a fallback idea) |
 | Discord result written to the `notes` column | Apps Script's Executions page often won't expand web-app runs to show logs; the Sheet is always readable | Relying on console logs |
 | `SCRIPT_REVISION` in the health check | Hard to tell which code version is live otherwise | n/a |
+| **Kit webhooks → Worker → Discord** for confirm/cancel alerts | Instant. Verified by test that the free Newsletter plan can list and create webhook endpoints, despite Kit's docs implying free plans get `401`. The Worker receives them because it already exists, always answers within Kit's 10s limit, and can reach Discord | Detecting state changes during `syncFromProvider` (works on any plan, but up to an hour late). Receiving in Apps Script (`doPost` replies via a 302 redirect, which webhook senders may treat as failure → duplicate retries) |
+| Worker replies 200 before posting to Discord | A Discord failure must not make Kit redeliver (duplicate alerts for anything that did post) | No event-ID dedupe: the Cache API doesn't persist on `workers.dev`, and duplicates only happen if Kit redelivers |
+| Hourly `syncFromProvider` | Keeps the Sheet's `status`/suppression list close to Kit's truth | Daily (the original) |
 | Static QR codes encoding our own domain | No expiry or vendor dependence; the destination can change without reprinting | "Dynamic QR" services (can be paywalled later) |
 
 ---
@@ -167,7 +189,7 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 2. **CORS:** the site must send a "simple request" (form-encoded body, no custom headers, no JSON content type). Apps Script can't answer CORS preflight. Apps Script replies via a 302 to `script.googleusercontent.com`; `fetch` follows it automatically.
 3. **Discord blocks Apps Script.** Never point the webhook property at `discord.com` directly. Cloudflare Worker IPs are shared too and can occasionally be rate-limited; if `notes` starts showing `discord:429` again, consider email alerts (`MailApp`) as a fallback.
 4. **Kit's create-subscriber call is an upsert that can't change `state`.** Someone who unsubscribed and signs up again gets no new row (their email is already in the Sheet) and isn't reactivated. Resubscribe them manually in Kit and set the Sheet `status` back to `active`.
-5. **Kit double opt-in via API was reported broken by one developer** (confirming left the subscriber `inactive`); another documented it working. Confirm periodically that confirmed signups flip to `active` after `syncFromProvider`. If they don't, set `DOUBLE_OPT_IN=false` and turn off the form's incentive email in Kit.
+5. **Kit double opt-in via API was reported broken by one developer** (confirming left the subscriber `inactive`); another documented it working. **On this account it works:** confirming fires Kit's `subscriber.activated` webhook, which only happens on a transition to `active` (verified 2026-10-01 via the "Sub confirmed" alert). If "Sub confirmed" alerts ever stop arriving while confirmations still happen, re-check this. If they don't, set `DOUBLE_OPT_IN=false` and turn off the form's incentive email in Kit.
 6. **Kit unconfirmed subscribers never receive broadcasts.** That's expected with DOI. Don't try to bulk-activate them: typos and spam complaints hurt deliverability.
 7. **Consent text is duplicated** between `index.html` and `CONSENT_TEXT` in `Code.gs`. Change both, bump `CONSENT_VERSION`, redeploy the script.
 8. **Dedupe means repeat tests do nothing.** Always test with a new address.
@@ -175,6 +197,9 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 10. **Apps Script quotas (consumer account):** 20,000 URL fetches/day, 30 simultaneous executions, 90 min/day of trigger runtime. Far above expected load.
 11. **Kit free plan limits:** 10,000 *active* subscribers; above that, sending stops until upgrade. One basic automation.
 12. **The editor shows Google's "unverified app" warning** on authorization. That's expected for a personal script (Advanced → Go to battlerun-signup).
+13. **Kit-webhook alerts have no `source`.** Kit's payload doesn't carry our `?src=` value; only the masked email is shown. Look up the source in the Sheet if needed.
+14. **Kit-webhook alerts and the Sheet are independent.** An alert doesn't mean the Sheet is updated yet; it catches up on the next hourly sync.
+15. **Kit's signing secret is shown once.** If it's lost, the Worker can't verify deliveries (every delivery gets `401`, and Kit retries for ~41h, then gives up).
 
 ---
 
@@ -187,6 +212,8 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 | Row exists, `provider_status` = `error_*` | `notes` has Kit's response. `401` → bad `KIT_API_KEY`; `404` on form → bad `KIT_FORM_ID`; `429` → rate limit (auto-retried). `error_config` → property missing |
 | No confirmation email | Check Kit: is the subscriber on form 9984140, and is the form's incentive email on? Check spam/Promotions. Domain authentication (SPF/DKIM for devilinorbit.com in Kit) affects inbox placement |
 | No Discord alert | Read `notes`: `discord:204` = delivered (check the webhook's channel); `discord:429 … 1015` = blocked (property not using the relay host?); `discord:404` from the relay = `ALLOWED_WEBHOOK_ID` mismatch or wrong path; `discord:401/404` from Discord = webhook deleted; `discord:no-webhook-property` = property missing; empty notes = old code deployed (check `revision`) |
+| No "Sub confirmed"/"Sub cancelled" alert | Worker live logs while repeating the action: nothing arrives → check `listKitWebhooks()` (status `active`, URL ends `/kit-webhook`); `401 Bad signature` → `KIT_WEBHOOK_SECRET` wrong; `503` → a Worker secret missing; `200` but no message → Worker log shows `Discord post failed` (check `DISCORD_WEBHOOK_URL`) |
+| Every alert arrives twice | Duplicate Kit endpoints (`registerKitWebhook` run twice); delete one via Kit's delete-endpoint API |
 | Live behavior doesn't match the repo code | GET `/exec` and compare `revision` with `SCRIPT_REVISION` in the repo |
 | Old text still on the site after a push | Browser cache (~10 min) or Pages still deploying; test in a private window |
 
@@ -206,7 +233,7 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 
 ## 11. Compliance notes (not legal advice)
 
-- CAN-SPAM: Kit adds an unsubscribe link and the sender's postal address to every email; both must stay valid. Unsubscribes are honored by Kit and mirrored to the Sheet nightly.
+- CAN-SPAM: Kit adds an unsubscribe link and the sender's postal address to every email; both must stay valid. Unsubscribes are honored by Kit and mirrored to the Sheet hourly.
 - Consent proof per row: `timestamp`, `source`, `consent_text`, `consent_version`, plus Kit's confirmation for DOI.
 - The privacy page (`privacy.html`) promises: email only used for Battlerun news, never sold, stored in the Sheet + Kit, deletion on request via `news@devilinorbit.com`, 13+ only. Keep the system consistent with those promises.
 - Data-deletion request: delete in Kit **and** delete the Sheet row. Unsubscribe-only request: unsubscribe in Kit and keep the row (it's the do-not-email record).
@@ -215,10 +242,12 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 
 ## 12. Open items
 
-- [ ] Confirm that a confirmed double opt-in subscriber becomes `active` in Kit and in the Sheet after `syncFromProvider` (gotcha 5).
+- [x] Confirmed double opt-in subscribers become `active` in Kit (verified 2026-10-01 through the `subscriber.activated` webhook; see gotcha 5).
 - [ ] Customize Kit's confirmation email (subject "Confirm your Battlerun signup", button "Yes, sign me up", sender name "Battlerun") and set the post-confirm redirect to `https://devilinorbit.com/confirmed.html`, if not already done.
 - [ ] Authenticate `devilinorbit.com` as a sending domain in Kit (SPF/DKIM records at Namecheap), if not already done.
-- [ ] Confirm `SITE_ORIGIN` is `https://devilinorbit.com` (the `Code.gs` header comment shows an older github.io example).
+- [ ] Confirm `SITE_ORIGIN` is `https://devilinorbit.com` (the `Code.gs` header comment shows an older github.io example). It only affects the referrer recorded in Kit.
+
+These were not verified from the agent side; the operator may already have done them.
 
 ---
 
@@ -230,6 +259,7 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 - Kit DOI-via-API reports: <https://github.com/jbranchaud/til/blob/master/workflow/add-subscriber-to-kit-form-via-api.md> (works) vs <https://github.com/delgado-jason/dash/pull/499> (stayed inactive)
 - Apps Script web apps: <https://developers.google.com/apps-script/guides/web>; quotas: <https://developers.google.com/apps-script/guides/services/quotas>
 - Apps Script CORS pattern: <https://github.com/tanaikech/taking-advantage-of-Web-Apps-with-google-apps-script>
+- Kit webhooks: <https://developers.kit.com/webhooks/overview.md> (event types, delivery format, verifying signatures, retries)
 - Discord blocking Apps Script (429/1015): <https://github.com/discord/discord-api-docs/issues/8411>; Worker relay approach: <https://efo-yu.github.io/post/tech/cfw-proxy-for-discord-webhook/>
 - GitHub Pages custom domains: <https://docs.github.com/en/pages/configuring-a-custom-domain-for-your-github-pages-site>
 - CAN-SPAM: <https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business>

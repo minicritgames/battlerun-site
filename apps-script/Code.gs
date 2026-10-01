@@ -8,7 +8,7 @@
 //   not discord.com: Discord blocks Apps Script's shared IPs with 429 / error code 1015.
 
 // Bump on every code change; the health check (GET on the /exec URL) reports it, which shows what is actually live.
-const SCRIPT_REVISION = '2026-10-01-discord-relay';
+const SCRIPT_REVISION = '2026-10-01-alert-titles-hourly-sync';
 const SHEET_NAME = 'Subscribers';
 // Must match the consent line on the site (index.html) word for word. Bump CONSENT_VERSION whenever the text changes.
 const CONSENT_TEXT = 'Get news and playtest invites by email. Unsubscribe anytime. You must be 13 or older.';
@@ -198,12 +198,12 @@ function notifyDiscord_(email, source, result) {
   const url = PropertiesService.getScriptProperties().getProperty('DISCORD_SIGNUP_WEBHOOK_URL');
   if (!url) return 'discord:no-webhook-property';
   const failed = String(result.status).startsWith('error');
-  let description = '`' + maskEmail_(email) + '`\nfrom: `' + source + '`';
+  let description = '`' + maskEmail_(email) + '`\nsource: `' + source + '`';
   if (failed) {
     description += '\n:warning: Kit forward failed (`' + result.status + '`); will retry automatically.';
   }
   const embed = {
-    title: 'New subscriber',
+    title: 'Sub requested',
     description: description,
     color: failed ? 15548997 : 16115650, // red on failure, otherwise the normal accent
   };
@@ -264,8 +264,44 @@ function setup() {
 
 function installTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('syncFromProvider').timeBased().everyDays(1).atHour(3).create();
+  ScriptApp.newTrigger('syncFromProvider').timeBased().everyHours(1).create();
   ScriptApp.newTrigger('retryFailedForwards').timeBased().everyHours(6).create();
+}
+
+// Registers Kit → Worker webhooks for confirm/unsubscribe/bounce/complaint alerts. Run once from the editor.
+// The response holds the signing secret (whsec_...) in plaintext exactly once: copy it from the Execution log into
+// the Worker's KIT_WEBHOOK_SECRET secret. Running this twice creates a duplicate endpoint (see listKitWebhooks).
+function registerKitWebhook() {
+  const props = PropertiesService.getScriptProperties();
+  const relayOrigin = String(props.getProperty('DISCORD_SIGNUP_WEBHOOK_URL') || '').match(/^https:\/\/[^/]+/);
+  if (!relayOrigin || relayOrigin[0].indexOf('discord.com') !== -1) {
+    throw new Error('DISCORD_SIGNUP_WEBHOOK_URL must already point at the relay Worker host');
+  }
+  const res = UrlFetchApp.fetch('https://api.kit.com/v4/webhook_endpoints', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Kit-Api-Key': props.getProperty('KIT_API_KEY') },
+    payload: JSON.stringify({
+      url: relayOrigin[0] + '/kit-webhook',
+      events: [
+        'subscriber.activated',
+        'subscriber.unsubscribed',
+        'subscriber.bounced',
+        'subscriber.complained',
+      ],
+      name: 'Discord subscriber alerts',
+    }),
+    muteHttpExceptions: true,
+  });
+  console.log(res.getResponseCode() + ' ' + res.getContentText());
+}
+
+function listKitWebhooks() {
+  const res = UrlFetchApp.fetch('https://api.kit.com/v4/webhook_endpoints', {
+    headers: { 'X-Kit-Api-Key': PropertiesService.getScriptProperties().getProperty('KIT_API_KEY') },
+    muteHttpExceptions: true,
+  });
+  console.log(res.getResponseCode() + ' ' + res.getContentText());
 }
 
 // Helpers
