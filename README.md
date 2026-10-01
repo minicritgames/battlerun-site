@@ -17,6 +17,7 @@ QR code → GitHub Pages (this repo) → Apps Script (apps-script/Code.gs) → G
 | `confirmed.html` | "You're in" page Kit redirects to after someone clicks the confirmation link |
 | `config.js` | **The only file to edit for URLs**: Apps Script `/exec` URL, Discord invite, success title/message |
 | `apps-script/Code.gs` | Backend source of record. Paste into the Apps Script editor bound to the Sheet |
+| `discord-relay/worker.js` | Cloudflare Worker that relays signup alerts to Discord (Discord blocks Apps Script's IPs directly) |
 | `qr/` | Generated QR codes |
 
 ## Where things live
