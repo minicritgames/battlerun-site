@@ -13,6 +13,7 @@ QR code → devilinorbit.com (GitHub Pages, this repo)
             └─► Cloudflare Worker relay ─► Discord "Sub requested"
 
 Kit webhooks (instant) ─► Cloudflare Worker /kit-webhook ─► Discord "Sub confirmed" / "Sub cancelled" / bounce / spam
+                                                        └─► broadcast channel: teaser + link when a broadcast is sent
 Hourly trigger: syncFromProvider pulls Kit's subscriber states into the Sheet
 ```
 
@@ -24,7 +25,7 @@ Hourly trigger: syncFromProvider pulls Kit's subscriber states into the Sheet
    - Redeploy Apps Script as a **new version** of the existing deployment, never a **new deployment** (that changes the URL the site calls).
    - Editor "Run" uses saved code; the live `/exec` URL uses the deployed version. Check `revision` in the health check.
    - Changing `installTriggers()` does nothing until you run `installTriggers` again.
-   - Running `registerKitWebhook()` again creates a duplicate Kit endpoint (every alert arrives twice).
+   - Running `registerKitWebhook()` again creates a duplicate Kit endpoint (every alert arrives twice). To change which Kit events are delivered, edit `KIT_WEBHOOK_EVENTS` and run `updateKitWebhookEvents()`.
    - Discord blocks Apps Script's IPs (429 / error 1015), so Apps Script must post through the Worker relay, never to discord.com directly.
    - Repeat tests with the same email do nothing (dedupe). Use a new `+tag` address every time.
    - The consent line in `index.html` must match `CONSENT_TEXT` in `Code.gs` word for word.
@@ -51,9 +52,12 @@ Hourly trigger: syncFromProvider pulls Kit's subscriber states into the Sheet
 | Subscriber list (master copy) | Google Sheet **Battlerun Subscribers** → tab **Subscribers** (private, never share) |
 | Backend script, its settings, triggers, logs | From the Sheet: **Extensions → Apps Script**. Settings: gear icon → Script Properties. Triggers: clock icon. Runs: Executions |
 | Sending newsletters | Kit (kit.com), free Newsletter plan, form **Website signup** (ID 9984140), double opt-in on |
+| Newsletter archive site | <https://news.devilinorbit.com>: Kit's Newsletter Site (Kit → Grow → Newsletter site; click **Publish** after edits). Shows broadcasts you publish to the web, and has Kit's own signup form (those signups reach the Sheet via the hourly sync) |
+| `news` subdomain DNS | Namecheap → Advanced DNS: three `A` records with host `news` pointing to Kit (`3.13.222.255`, `3.13.246.91`, `3.130.60.26`). Leave every other record alone |
 | Kit webhook endpoint | Registered through Kit's API by `registerKitWebhook()`, named "Discord subscriber alerts", pointing at `<worker-host>/kit-webhook`. Inspect with `listKitWebhooks()` |
 | Discord relay / webhook receiver | Cloudflare → **Workers & Pages → `discord-relay`** (`*.workers.dev`). Secrets under Settings → Variables and Secrets; live logs under Logs/Observability |
 | Discord alerts | A private channel in the Battlerun Discord server, fed by one channel webhook |
+| Discord broadcast announcements | A separate channel with its own webhook (`DISCORD_BROADCAST_WEBHOOK_URL` in the Worker) |
 | Discord invite on the site | `discordInvite` in `config.js` (permanent invite: never expires, unlimited uses) |
 | Domain, DNS, email forwarding | Namecheap → devilinorbit.com (`news@devilinorbit.com` forwards to the owner's Gmail) |
 | Site hosting | This repo → Settings → Pages (branch `main`, root; custom domain devilinorbit.com, HTTPS enforced) |
@@ -70,6 +74,9 @@ The repo is public (required for free GitHub Pages), and Pages serves every file
 | `ALLOWED_WEBHOOK_ID` | Cloudflare Worker variable (Text): the numeric webhook ID | No |
 | `DISCORD_WEBHOOK_URL` | Cloudflare Worker secret: the same webhook with the normal `discord.com` host | **Yes** |
 | `KIT_WEBHOOK_SECRET` | Cloudflare Worker secret: the `whsec_...` signing secret Kit showed **once** at registration | **Yes** |
+| `DISCORD_BROADCAST_WEBHOOK_URL` | Cloudflare Worker secret: the broadcast channel's webhook (normal `discord.com` host) | **Yes** |
+| `KIT_API_KEY` | Cloudflare Worker secret (same key as in Apps Script): looks up a broadcast's web link | **Yes** |
+| `BROADCAST_PUBLIC_ONLY` | Cloudflare Worker variable (Text): `true` = announce only web-published broadcasts; unset/anything else = every broadcast (current) | No |
 
 Script Property and Worker secret changes apply immediately, with no code redeploy. If the Discord webhook leaks, make a new webhook and update all three Discord settings.
 
@@ -79,7 +86,7 @@ Script Property and Worker secret changes apply immediately, with no code redepl
 
 - **status** is the column that matters: `unconfirmed` (hasn't clicked the confirmation email yet), `active`, `unsubscribed`, `bounced`, `complained`.
 - **provider_status** is Kit's side: `pending_confirmation` / `subscribed` right after signup, then Kit's own words (`inactive`, `active`, `cancelled`, …) after each sync.
-- **source** is which QR code or link they came from (`direct` = typed the address).
+- **source** is which QR code or link they came from (`direct` = typed the address). `kit` means they subscribed outside this site (on the Kit newsletter site, or you added them in Kit); the hourly sync adds those rows and sends a "Sub requested" alert with `source: kit`.
 - **notes** holds Kit's error detail if forwarding failed, then the Discord result, e.g. `discord:204` (delivered).
 - The Sheet syncs with Kit every hour. To sync now: Apps Script → pick `syncFromProvider` → **Run**.
 - A **provider_status** starting with `error_` means forwarding to Kit failed. It retries every 6 hours; if it keeps failing, the Kit API key or form ID is probably wrong (check Script Properties).
@@ -88,10 +95,11 @@ Script Property and Worker secret changes apply immediately, with no code redepl
 
 | Alert | Sent by | When |
 |---|---|---|
-| **Sub requested** (masked email + `source:`) | Apps Script, through the Worker relay | Someone submits the form (new emails only) |
+| **Sub requested** (masked email + `source:`) | Apps Script, through the Worker relay | Someone submits the form (new emails only), or the hourly sync finds a new Kit-only subscriber (`source: kit`, up to an hour late) |
 | **Sub confirmed** (green) | Kit webhook → Worker | They click the confirmation link |
 | **Sub cancelled** (red) | Kit webhook → Worker | They unsubscribe (or you unsubscribe them in Kit) |
 | **Email bounced** (orange) / **Marked as spam** (red) | Kit webhook → Worker | Kit reports a hard bounce or a spam complaint |
+| **Broadcast announcement** (broadcast channel; subject as title, preview text, "Read it here" link if published to the web) | Kit webhook → Worker | A broadcast finishes sending |
 
 Kit-webhook alerts can't show the source, because Kit doesn't send it. The Sheet catches up on the next hourly sync; alerts don't update it.
 
@@ -104,7 +112,7 @@ Kit-webhook alerts can't show the source, because Kit doesn't send it. The Sheet
 ### Removing someone
 
 - **"Stop emailing me"** → in Kit, open their profile and unsubscribe them. Leave the Sheet row; the hourly sync marks it `unsubscribed`, and that row is the permanent do-not-email record.
-- **"Delete my data"** (or test addresses) → in Kit, open their profile → **Delete Subscriber**, **and** delete their row in the Sheet (right-click the row number → Delete row). Do both.
+- **"Delete my data"** (or test addresses) → **first** in Kit, open their profile → **Delete Subscriber**, **then** delete their row in the Sheet (right-click the row number → Delete row). Do both, in that order: the hourly sync re-adds anyone still in Kit but missing from the Sheet.
 - **Someone who unsubscribed wants back in** → re-signing up does nothing automatically (their email is already in the Sheet, and Kit's API can't reactivate them). In Kit, resubscribe them, then set their Sheet **status** back to `active`.
 
 ### Paper signups (bad booth Wi-Fi)

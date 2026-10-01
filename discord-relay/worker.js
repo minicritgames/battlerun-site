@@ -1,15 +1,18 @@
 // Cloudflare Worker with two jobs. Paste this into the Worker's code editor in the Cloudflare dashboard.
 // See docs/system.md for how it fits into the signup system.
 //
-// 1) POST /api/webhooks/<id>/<token>: relays Apps Script's "new subscriber" alerts to Discord.
+// 1) POST /api/webhooks/<id>/<token>: relays Apps Script's "Sub requested" alerts to Discord.
 //    Discord's Cloudflare protection blocks Google's shared Apps Script IPs (429, error code 1015); Worker IPs aren't
 //    affected. Apps Script uses the Discord webhook URL with only the host swapped to this Worker's host.
 //    Variable ALLOWED_WEBHOOK_ID (Text) = <id>, so this can't be used as an open relay to other people's webhooks.
 //
-// 2) POST /kit-webhook: receives Kit webhook deliveries (subscriber confirmed/unsubscribed/bounced/complained),
-//    verifies Kit's signature, and posts a masked alert straight to Discord.
-//    Secrets: KIT_WEBHOOK_SECRET (the whsec_... value Kit returns once when the endpoint is registered) and
-//    DISCORD_WEBHOOK_URL (the full https://discord.com/api/webhooks/<id>/<token> URL).
+// 2) POST /kit-webhook: receives Kit webhook deliveries and verifies Kit's signature.
+//    - Subscriber events (confirmed/unsubscribed/bounced/complained) → masked alert to DISCORD_WEBHOOK_URL.
+//    - broadcast.sent → teaser embed (subject, preview text, "Read it here" link) to DISCORD_BROADCAST_WEBHOOK_URL.
+//    Secrets: KIT_WEBHOOK_SECRET (the whsec_... value Kit returns once when the endpoint is registered),
+//    DISCORD_WEBHOOK_URL and DISCORD_BROADCAST_WEBHOOK_URL (full https://discord.com/api/webhooks/<id>/<token> URLs),
+//    KIT_API_KEY (looks up a broadcast's public link; the webhook payload doesn't include it).
+//    Variable BROADCAST_PUBLIC_ONLY (Text): "true" announces only web-published broadcasts; anything else announces all.
 
 const KIT_EVENTS = {
   'subscriber.activated': { title: 'Sub confirmed', color: 5763719 }, // green
@@ -17,6 +20,7 @@ const KIT_EVENTS = {
   'subscriber.bounced': { title: 'Email bounced', color: 15105570 }, // orange
   'subscriber.complained': { title: 'Marked as spam', color: 15548997 }, // red
 };
+const BROADCAST_COLOR = 16115650; // same as the "Sub requested" alert
 const SIGNATURE_TOLERANCE_SECONDS = 300;
 
 export default {
@@ -64,19 +68,70 @@ async function handleKitWebhook(request, env, ctx) {
   }
 
   const embeds = [];
+  const broadcasts = [];
   for (const event of events) {
+    if (event.type === 'broadcast.sent' && event.data && event.data.broadcast) {
+      broadcasts.push(event.data.broadcast);
+      continue;
+    }
     const kind = KIT_EVENTS[event.type];
     const email = event.data && event.data.subscriber && event.data.subscriber.email_address;
     if (!kind || !email) continue;
     embeds.push({ title: kind.title, description: '`' + maskEmail(email) + '`', color: kind.color });
   }
 
-  // Acknowledge Kit immediately; the Discord post finishes in the background. A Discord failure is only logged,
+  // Acknowledge Kit immediately; the Discord posts finish in the background. A Discord failure is only logged,
   // because failing here would make Kit redeliver and could duplicate alerts that did go through.
   if (embeds.length) {
     ctx.waitUntil(postEmbeds(env.DISCORD_WEBHOOK_URL, embeds));
   }
+  if (broadcasts.length) {
+    ctx.waitUntil(announceBroadcasts(env, broadcasts));
+  }
   return new Response('ok');
+}
+
+async function announceBroadcasts(env, broadcasts) {
+  if (!env.DISCORD_BROADCAST_WEBHOOK_URL) {
+    console.error('broadcast.sent received but DISCORD_BROADCAST_WEBHOOK_URL is not set');
+    return;
+  }
+  const publicOnly = env.BROADCAST_PUBLIC_ONLY === 'true';
+  const embeds = [];
+  for (const broadcast of broadcasts) {
+    if (publicOnly && !broadcast.public) continue;
+    // Only web-published broadcasts have a public link, so private ones skip the lookup.
+    const publicUrl = broadcast.public ? await fetchBroadcastPublicUrl(env, broadcast.id) : '';
+    const teaser = broadcast.preview_text || broadcast.description || '';
+    const lines = [];
+    if (teaser) lines.push(teaser);
+    if (publicUrl) lines.push('[Read it here](' + publicUrl + ')');
+    const embed = { title: (broadcast.subject || 'Untitled broadcast').slice(0, 256), color: BROADCAST_COLOR };
+    if (publicUrl) embed.url = publicUrl;
+    if (lines.length) embed.description = lines.join('\n\n').slice(0, 4096);
+    embeds.push(embed);
+  }
+  if (embeds.length) {
+    await postEmbeds(env.DISCORD_BROADCAST_WEBHOOK_URL, embeds);
+  }
+}
+
+async function fetchBroadcastPublicUrl(env, broadcastId) {
+  if (!env.KIT_API_KEY || !broadcastId) return '';
+  try {
+    const res = await fetch('https://api.kit.com/v4/broadcasts/' + encodeURIComponent(broadcastId), {
+      headers: { 'X-Kit-Api-Key': env.KIT_API_KEY },
+    });
+    if (!res.ok) {
+      console.error('Kit broadcast lookup failed: ' + res.status);
+      return '';
+    }
+    const data = await res.json();
+    return (data.broadcast && data.broadcast.public_url) || '';
+  } catch (err) {
+    console.error('Kit broadcast lookup failed', err);
+    return '';
+  }
 }
 
 async function postEmbeds(webhookUrl, embeds) {

@@ -3,17 +3,21 @@
 // Paste this into the Apps Script editor's Code.gs, then redeploy as a NEW VERSION of the existing deployment.
 //
 // Secrets/config live in Project Settings → Script Properties (never in this file):
-//   KIT_API_KEY, KIT_FORM_ID, DOUBLE_OPT_IN ("true" | "false"), SITE_ORIGIN (e.g. "https://minicritgames.github.io/battlerun-site"),
+//   KIT_API_KEY, KIT_FORM_ID, DOUBLE_OPT_IN ("true" | "false"), SITE_ORIGIN ("https://devilinorbit.com"),
 //   DISCORD_SIGNUP_WEBHOOK_URL (optional; unset = no signup alerts). Use the relay host from discord-relay/worker.js,
 //   not discord.com: Discord blocks Apps Script's shared IPs with 429 / error code 1015.
 
 // Bump on every code change; the health check (GET on the /exec URL) reports it, which shows what is actually live.
-const SCRIPT_REVISION = '2026-10-01-alert-titles-hourly-sync';
+const SCRIPT_REVISION = '2026-10-01-sync-adds-kit-only';
 const SHEET_NAME = 'Subscribers';
 // Must match the consent line on the site (index.html) word for word. Bump CONSENT_VERSION whenever the text changes.
 const CONSENT_TEXT = 'Get news and playtest invites by email. Unsubscribe anytime. You must be 13 or older.';
 const CONSENT_VERSION = 'v2-2026-10';
 const DEDUPE_SECONDS = 600;
+// Rows the sync adds for people who subscribed outside this site (Kit's newsletter site, or added by hand in Kit).
+// Their consent was collected by Kit's form, not ours, so the row says so rather than claiming our wording.
+const KIT_ONLY_SOURCE = 'kit';
+const KIT_ONLY_CONSENT_TEXT = 'Subscribed outside devilinorbit.com (Kit newsletter site or added in Kit); consent collected by Kit.';
 const HEADERS = [
   'timestamp',
   'email',
@@ -142,11 +146,12 @@ function forwardToProvider_(email, source) {
   }
 }
 
-// Pulls every subscriber's state from Kit and mirrors it into the Sheet.
+// Pulls every subscriber's state from Kit and mirrors it into the Sheet, and adds anyone who is in Kit but not in
+// the Sheet (signed up on Kit's newsletter site, or added by hand in Kit) so the Sheet stays the complete list.
 // Keeps the Sheet's suppression list (unsubscribed/bounced/complained) correct for any future migration.
 function syncFromProvider() {
   const apiKey = PropertiesService.getScriptProperties().getProperty('KIT_API_KEY');
-  const states = {};
+  const kitSubscribers = {};
   let after = '';
   for (let page = 0; page < 100; page++) { // hard cap; 100 pages × 1000 = 100k subscribers
     let url = 'https://api.kit.com/v4/subscribers?status=all&per_page=1000&slim=true';
@@ -154,29 +159,76 @@ function syncFromProvider() {
     const res = UrlFetchApp.fetch(url, { headers: { 'X-Kit-Api-Key': apiKey }, muteHttpExceptions: true });
     if (res.getResponseCode() >= 300) throw new Error('Kit list failed: ' + res.getResponseCode());
     const body = JSON.parse(res.getContentText());
-    body.subscribers.forEach(s => { states[String(s.email_address).toLowerCase()] = s.state; });
+    body.subscribers.forEach(s => { kitSubscribers[String(s.email_address).toLowerCase()] = s; });
     if (!body.pagination || !body.pagination.has_next_page) break;
     after = body.pagination.end_cursor;
     Utilities.sleep(600); // stays well under Kit's 120 req/60s API-key limit
   }
 
-  const sheet = getSheet_();
-  const last = sheet.getLastRow();
-  if (last < 2) return;
-  const range = sheet.getRange(2, 1, last - 1, HEADERS.length);
-  const values = range.getValues();
-  const now = new Date();
-  values.forEach(r => {
-    const state = states[String(r[COL.email - 1]).toLowerCase()];
-    if (!state) return;
-    r[COL.provider_status - 1] = state;
-    r[COL.last_synced - 1] = now;
-    if (state === 'cancelled') r[COL.status - 1] = 'unsubscribed';
-    else if (state === 'bounced' || state === 'complained') r[COL.status - 1] = state;
-    else if (state === 'active') r[COL.status - 1] = 'active';
-    // 'inactive' = has not confirmed double opt-in yet; leave status alone (stays 'unconfirmed')
+  // Same lock as doPost: this function now appends rows, and doPost relies on rows never moving under it.
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  const added = [];
+  try {
+    const sheet = getSheet_();
+    const now = new Date();
+    const inSheet = {};
+    const last = sheet.getLastRow();
+    if (last >= 2) {
+      const range = sheet.getRange(2, 1, last - 1, HEADERS.length);
+      const values = range.getValues();
+      values.forEach(r => {
+        const email = String(r[COL.email - 1]).toLowerCase();
+        inSheet[email] = true;
+        const subscriber = kitSubscribers[email];
+        if (!subscriber) return;
+        r[COL.provider_status - 1] = subscriber.state;
+        r[COL.last_synced - 1] = now;
+        r[COL.status - 1] = statusForKitState_(subscriber.state, r[COL.status - 1]);
+      });
+      range.setValues(values);
+    }
+
+    Object.keys(kitSubscribers).forEach(email => {
+      if (inSheet[email] || !normalizeEmail_(email)) return;
+      const subscriber = kitSubscribers[email];
+      const row = [];
+      row[COL.timestamp - 1] = subscriber.created_at ? new Date(subscriber.created_at) : now;
+      row[COL.email - 1] = email;
+      row[COL.source - 1] = KIT_ONLY_SOURCE;
+      row[COL.consent_text - 1] = KIT_ONLY_CONSENT_TEXT;
+      row[COL.consent_version - 1] = 'kit';
+      row[COL.provider - 1] = 'kit';
+      row[COL.provider_status - 1] = subscriber.state;
+      row[COL.provider_subscriber_id - 1] = subscriber.id ? String(subscriber.id) : '';
+      row[COL.status - 1] = statusForKitState_(subscriber.state, 'unconfirmed');
+      row[COL.last_synced - 1] = now;
+      row[COL.notes - 1] = 'added by sync';
+      sheet.appendRow(row);
+      added.push({ email: email, state: subscriber.state, row: sheet.getLastRow() });
+    });
+  } finally {
+    lock.releaseLock();
+  }
+
+  // Alerts go out after the lock is released so a slow Discord call never delays a signup.
+  // Only for people who are, or may become, subscribers; an old unsubscribed address isn't a new signup.
+  added.forEach(entry => {
+    if (entry.state !== 'active' && entry.state !== 'inactive') return;
+    const discord = notifyDiscord_(entry.email, KIT_ONLY_SOURCE, { status: 'subscribed' });
+    const notes = getSheet_().getRange(entry.row, COL.notes);
+    notes.setValue([notes.getValue(), discord].filter(String).join(' | '));
+    Utilities.sleep(1000); // spaces out a burst (e.g. the first sync after this shipped) under Discord's webhook limits
   });
-  range.setValues(values);
+}
+
+// Maps Kit's subscriber state onto the Sheet's status column.
+function statusForKitState_(state, currentStatus) {
+  if (state === 'cancelled') return 'unsubscribed';
+  if (state === 'bounced' || state === 'complained') return state;
+  if (state === 'active') return 'active';
+  // 'inactive' = has not confirmed double opt-in yet; keep what the row already says (normally 'unconfirmed')
+  return currentStatus;
 }
 
 // Re-forwards rows whose provider call failed. Runs on a trigger; can also be run manually.
@@ -268,7 +320,17 @@ function installTriggers() {
   ScriptApp.newTrigger('retryFailedForwards').timeBased().everyHours(6).create();
 }
 
-// Registers Kit → Worker webhooks for confirm/unsubscribe/bounce/complaint alerts. Run once from the editor.
+// Kit events delivered to the Worker's /kit-webhook. To change them on the live endpoint, edit this list and run
+// updateKitWebhookEvents (never re-register: that creates a duplicate endpoint).
+const KIT_WEBHOOK_EVENTS = [
+  'subscriber.activated',
+  'subscriber.unsubscribed',
+  'subscriber.bounced',
+  'subscriber.complained',
+  'broadcast.sent',
+];
+
+// Registers the Kit → Worker webhook endpoint. Run once from the editor, ever.
 // The response holds the signing secret (whsec_...) in plaintext exactly once: copy it from the Execution log into
 // the Worker's KIT_WEBHOOK_SECRET secret. Running this twice creates a duplicate endpoint (see listKitWebhooks).
 function registerKitWebhook() {
@@ -283,14 +345,33 @@ function registerKitWebhook() {
     headers: { 'X-Kit-Api-Key': props.getProperty('KIT_API_KEY') },
     payload: JSON.stringify({
       url: relayOrigin[0] + '/kit-webhook',
-      events: [
-        'subscriber.activated',
-        'subscriber.unsubscribed',
-        'subscriber.bounced',
-        'subscriber.complained',
-      ],
+      events: KIT_WEBHOOK_EVENTS,
       name: 'Discord subscriber alerts',
     }),
+    muteHttpExceptions: true,
+  });
+  console.log(res.getResponseCode() + ' ' + res.getContentText());
+}
+
+// Sets the existing /kit-webhook endpoint's events to KIT_WEBHOOK_EVENTS. Safe to run repeatedly; the secret is unchanged.
+function updateKitWebhookEvents() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('KIT_API_KEY');
+  const list = UrlFetchApp.fetch('https://api.kit.com/v4/webhook_endpoints', {
+    headers: { 'X-Kit-Api-Key': apiKey },
+    muteHttpExceptions: true,
+  });
+  if (list.getResponseCode() >= 300) throw new Error('Kit list failed: ' + list.getResponseCode() + ' ' + list.getContentText());
+  const endpoints = JSON.parse(list.getContentText()).webhook_endpoints
+    .filter(endpoint => String(endpoint.url).endsWith('/kit-webhook'));
+  if (endpoints.length !== 1) {
+    throw new Error('Expected exactly one /kit-webhook endpoint, found ' + endpoints.length + '; check listKitWebhooks');
+  }
+  // Kit replaces the whole event list with what's sent, so always send the complete set.
+  const res = UrlFetchApp.fetch('https://api.kit.com/v4/webhook_endpoints/' + endpoints[0].id, {
+    method: 'patch',
+    contentType: 'application/json',
+    headers: { 'X-Kit-Api-Key': apiKey },
+    payload: JSON.stringify({ events: KIT_WEBHOOK_EVENTS }),
     muteHttpExceptions: true,
   });
   console.log(res.getResponseCode() + ' ' + res.getContentText());

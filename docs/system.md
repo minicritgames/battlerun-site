@@ -31,6 +31,8 @@ The page also shows a Discord invite button. Everything runs on free tiers.
 | Backend | Google Apps Script project `battlerun-signup`, **bound** to the Sheet (Sheet → Extensions → Apps Script) | [`apps-script/Code.gs`](../apps-script/Code.gs) | **Manual paste** into the editor, then redeploy as a new version (§6) | Google account that owns the Sheet |
 | Subscriber list | Google Sheet **Battlerun Subscribers**, tab **Subscribers** (private) | n/a (data) | n/a | Same Google account |
 | Newsletter provider | Kit, free Newsletter plan; form **Website signup**, ID `9984140` | n/a | Kit dashboard | Kit account |
+| Newsletter Site (web archive of broadcasts + Kit's own signup form) | Kit → Grow → Newsletter site, at `https://news.devilinorbit.com` (custom domain on the free plan; HTTPS by Kit) | n/a | Kit dashboard; **Publish** to apply changes | Kit account |
+| `news` subdomain DNS | Namecheap → Advanced DNS: three `A` records, host `news` → `3.13.222.255`, `3.13.246.91`, `3.130.60.26` (values from Kit's domain settings; re-check there if Kit ever says verification failed) | n/a | Namecheap dashboard. Never touch the `@`/`www` records (GitHub Pages) or mail records (email forwarding) | Namecheap |
 | Discord relay + Kit webhook receiver | Cloudflare Worker `discord-relay` on `*.workers.dev` | [`discord-relay/worker.js`](../discord-relay/worker.js) | **Manual paste** into the Cloudflare dashboard editor → Deploy | Cloudflare account (free) |
 | Kit webhook endpoint | Registered in Kit via the API (no dashboard UI used), name "Discord subscriber alerts", URL `https://<worker-host>/kit-webhook` | `registerKitWebhook()` in `Code.gs` | Run once from the Apps Script editor | Kit account |
 | Signup alerts | Private Discord channel with a webhook named for the newsletter | n/a | Discord channel settings → Integrations → Webhooks | Discord server |
@@ -70,12 +72,19 @@ Person clicks the confirmation link in Kit's email ──► Kit marks them acti
 Kit webhooks (instant), registered by registerKitWebhook():
   subscriber.activated → "Sub confirmed" (green)    subscriber.unsubscribed → "Sub cancelled" (red)
   subscriber.bounced   → "Email bounced" (orange)   subscriber.complained   → "Marked as spam" (red)
+  broadcast.sent       → broadcast channel (separate webhook): subject as title, preview text, "Read it here" link,
+                         color 16115650. The link comes from GET /v4/broadcasts/{id} (public_url) using the Worker's
+                         KIT_API_KEY; only web-published (public) broadcasts have one. BROADCAST_PUBLIC_ONLY="true"
+                         skips non-public broadcasts (currently every broadcast is announced).
   Worker /kit-webhook: verify X-Kit-Signature (HMAC-SHA256 of "<t>.<raw body>", 5-min tolerance)
                        → reply 200 immediately → post masked embeds to Discord in the background (ctx.waitUntil)
   These alerts do NOT update the Sheet; the hourly sync does.
 
 Time-based triggers (installed by installTriggers()):
-  syncFromProvider     hourly    : pulls every Kit subscriber state into the Sheet
+  syncFromProvider     hourly    : pulls every Kit subscriber state into the Sheet, and appends anyone in Kit but not in
+                                   the Sheet (Kit newsletter-site signups, manual adds) with source "kit" + a
+                                   "Sub requested" alert (only for active/inactive, not old unsubscribes). Runs under the
+                                   same script lock as doPost; Discord calls happen after the lock is released.
   retryFailedForwards  every 6h  : re-forwards rows whose provider_status is error_* or pending
 ```
 
@@ -89,7 +98,7 @@ Failures are isolated by design. A Kit failure still returns success to the visi
 |---|---|
 | `timestamp` | Signup time |
 | `email` | Lowercased, validated. Column B is formatted as plain text (formula-injection guard) |
-| `source` | `?src=` value from the URL, sanitized; `direct` if absent |
+| `source` | `?src=` value from the URL, sanitized; `direct` if absent. `kit` = added by the sync because they subscribed outside this site (Kit newsletter site at `news.devilinorbit.com`, or added by hand in Kit); those rows have consent text saying Kit collected the consent, consent_version `kit`, and notes `added by sync` |
 | `consent_text` | Exact consent wording shown at signup (`CONSENT_TEXT`) |
 | `consent_version` | `CONSENT_VERSION` at signup time (currently `v2-2026-10`) |
 | `provider` | `kit` |
@@ -119,6 +128,9 @@ Nothing secret is in this repo. The repo is **public** (free GitHub Pages requir
 | `ALLOWED_WEBHOOK_ID` | Cloudflare → Worker `discord-relay` → Settings → Variables and Secrets (Text) | No | The numeric `<id>` only. Restricts the relay to this one webhook |
 | `DISCORD_WEBHOOK_URL` | Cloudflare Worker → Variables and Secrets (**Secret**) | **Yes** | The same Discord webhook with the normal `https://discord.com/...` host. Used by `/kit-webhook` to post directly |
 | `KIT_WEBHOOK_SECRET` | Cloudflare Worker → Variables and Secrets (**Secret**) | **Yes** | The `whsec_...` signing secret Kit returned **once** from `registerKitWebhook()`. Lost → rotate it via Kit's API (rotate-secret endpoint) or delete and re-register the endpoint |
+| `DISCORD_BROADCAST_WEBHOOK_URL` | Cloudflare Worker (**Secret**) | **Yes** | Webhook for the broadcast-announcement channel (normal `discord.com` host). Unset = broadcast announcements skipped (logged); subscriber alerts unaffected |
+| `KIT_API_KEY` | Cloudflare Worker (**Secret**) | **Yes** | Same Kit API key as in Script Properties; used only to look up a broadcast's `public_url`. Missing or failing lookup = announcement posts without a link |
+| `BROADCAST_PUBLIC_ONLY` | Cloudflare Worker (Text) | No | `true` = announce only web-published broadcasts; anything else (or unset) = every broadcast. Currently every broadcast |
 | `signupEndpoint` | `config.js` | No | Apps Script `/exec` URL. Public by design |
 | `discordInvite` | `config.js` | No | Permanent invite (never expires, unlimited uses) |
 | `successTitle` / `successMessage` | `config.js` | No | Post-signup screen text; `{email}` is replaced with the typed address |
@@ -150,7 +162,7 @@ Workers & Pages → `discord-relay` → Edit code → paste `discord-relay/worke
 Changing `installTriggers()` doesn't change existing triggers. After pasting new code, run `installTriggers` once from the editor (it deletes and recreates all of them). Check under **Triggers** (clock icon) in the sidebar.
 
 ### Kit webhook endpoint
-Registered once with `registerKitWebhook()`. Running it again creates a **duplicate** endpoint (duplicate alerts). `listKitWebhooks()` shows what's registered. To change the event list or URL, use Kit's update-endpoint API rather than re-registering.
+Registered once with `registerKitWebhook()`. Running it again creates a **duplicate** endpoint (duplicate alerts). `listKitWebhooks()` shows what's registered. To change which events are delivered, edit `KIT_WEBHOOK_EVENTS` in `Code.gs` and run `updateKitWebhookEvents()`. It PATCHes the single `/kit-webhook` endpoint with the full list (Kit replaces the list rather than merging), keeps the signing secret, and is safe to rerun.
 
 ### Testing a signup without a browser
 ```bash
@@ -179,6 +191,8 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 | **Kit webhooks → Worker → Discord** for confirm/cancel alerts | Instant. Verified by test that the free Newsletter plan can list and create webhook endpoints, despite Kit's docs implying free plans get `401`. The Worker receives them because it already exists, always answers within Kit's 10s limit, and can reach Discord | Detecting state changes during `syncFromProvider` (works on any plan, but up to an hour late). Receiving in Apps Script (`doPost` replies via a 302 redirect, which webhook senders may treat as failure → duplicate retries) |
 | Worker replies 200 before posting to Discord | A Discord failure must not make Kit redeliver (duplicate alerts for anything that did post) | No event-ID dedupe: the Cache API doesn't persist on `workers.dev`, and duplicates only happen if Kit redelivers |
 | Hourly `syncFromProvider` | Keeps the Sheet's `status`/suppression list close to Kit's truth | Daily (the original) |
+| Broadcast announcements as a teaser + link, in their own channel | Kit's email HTML doesn't translate to Discord (images/layout lost, 4096-char embed limit); a link sends people to the real thing | Converting the full email body |
+| Announce every broadcast now, `BROADCAST_PUBLIC_ONLY` switch for later | The current use is the operator seeing when sends go out; a public announcement channel later should only show web-published broadcasts, so segment sends aren't announced to everyone | Hard-coding either behavior |
 | Static QR codes encoding our own domain | No expiry or vendor dependence; the destination can change without reprinting | "Dynamic QR" services (can be paywalled later) |
 
 ---
@@ -200,6 +214,10 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 13. **Kit-webhook alerts have no `source`.** Kit's payload doesn't carry our `?src=` value; only the masked email is shown. Look up the source in the Sheet if needed.
 14. **Kit-webhook alerts and the Sheet are independent.** An alert doesn't mean the Sheet is updated yet; it catches up on the next hourly sync.
 15. **Kit's signing secret is shown once.** If it's lost, the Worker can't verify deliveries (every delivery gets `401`, and Kit retries for ~41h, then gives up).
+16. **`broadcast.sent` payloads carry no link or body.** The Worker fetches `public_url` from the broadcasts API. Non-public broadcasts never have a link. Whether Kit's "Send test email" fires `broadcast.sent` is unverified (expected: no); test with a real broadcast filtered to your own address.
+17. **Switching the broadcast channel to public:** set `BROADCAST_PUBLIC_ONLY` to `true` first, and make sure broadcasts meant for the public are published to the web in Kit.
+18. **Deleting someone: Kit first, then the Sheet.** The hourly sync re-adds anyone who is still in Kit but missing from the Sheet. Delete the subscriber in Kit, then delete the row.
+19. **Two signup paths.** Our site (row written instantly, "Sub requested" instantly) and Kit's newsletter site (`news.devilinorbit.com`; row and "Sub requested" appear on the next hourly sync, so "Sub confirmed" may arrive before "Sub requested"). Kit-site signups never pass through `doPost`, so they get Kit's form settings (double opt-in there must be enabled in Kit's newsletter-site form settings).
 
 ---
 
@@ -213,6 +231,8 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 | No confirmation email | Check Kit: is the subscriber on form 9984140, and is the form's incentive email on? Check spam/Promotions. Domain authentication (SPF/DKIM for devilinorbit.com in Kit) affects inbox placement |
 | No Discord alert | Read `notes`: `discord:204` = delivered (check the webhook's channel); `discord:429 … 1015` = blocked (property not using the relay host?); `discord:404` from the relay = `ALLOWED_WEBHOOK_ID` mismatch or wrong path; `discord:401/404` from Discord = webhook deleted; `discord:no-webhook-property` = property missing; empty notes = old code deployed (check `revision`) |
 | No "Sub confirmed"/"Sub cancelled" alert | Worker live logs while repeating the action: nothing arrives → check `listKitWebhooks()` (status `active`, URL ends `/kit-webhook`); `401 Bad signature` → `KIT_WEBHOOK_SECRET` wrong; `503` → a Worker secret missing; `200` but no message → Worker log shows `Discord post failed` (check `DISCORD_WEBHOOK_URL`) |
+| No broadcast announcement | Worker live logs while a broadcast finishes sending: `DISCORD_BROADCAST_WEBHOOK_URL is not set`; nothing at all → `broadcast.sent` missing from the endpoint's events (`listKitWebhooks`, then `updateKitWebhookEvents`); `BROADCAST_PUBLIC_ONLY=true` with a non-public broadcast → skipped by design |
+| Broadcast announced without a link | Broadcast isn't public, or `KIT_API_KEY` is missing/wrong in the Worker (log shows `Kit broadcast lookup failed`) |
 | Every alert arrives twice | Duplicate Kit endpoints (`registerKitWebhook` run twice); delete one via Kit's delete-endpoint API |
 | Live behavior doesn't match the repo code | GET `/exec` and compare `revision` with `SCRIPT_REVISION` in the repo |
 | Old text still on the site after a push | Browser cache (~10 min) or Pages still deploying; test in a private window |
@@ -245,7 +265,10 @@ Use `-d` (which implies POST). **Don't add `-X POST`**: with `-L`, curl re-POSTs
 - [x] Confirmed double opt-in subscribers become `active` in Kit (verified 2026-10-01 through the `subscriber.activated` webhook; see gotcha 5).
 - [ ] Customize Kit's confirmation email (subject "Confirm your Battlerun signup", button "Yes, sign me up", sender name "Battlerun") and set the post-confirm redirect to `https://devilinorbit.com/confirmed.html`, if not already done.
 - [ ] Authenticate `devilinorbit.com` as a sending domain in Kit (SPF/DKIM records at Namecheap), if not already done.
-- [ ] Confirm `SITE_ORIGIN` is `https://devilinorbit.com` (the `Code.gs` header comment shows an older github.io example). It only affects the referrer recorded in Kit.
+- [ ] Confirm the `SITE_ORIGIN` Script Property is `https://devilinorbit.com`. It only affects the referrer recorded in Kit.
+- [x] Kit Newsletter Site live at `https://news.devilinorbit.com` (DNS verified 2026-10-01: resolves to Kit's three IPs, valid HTTPS; main site unaffected).
+- [ ] Newsletter Site signup form has double opt-in on, and its nav links back to devilinorbit.com and Discord.
+- [ ] End-to-end test of a Newsletter Site signup: instant "Sub confirmed", then within the hour a `source: kit` row + "Sub requested" alert.
 
 These were not verified from the agent side; the operator may already have done them.
 
